@@ -37,7 +37,7 @@ module_types = [
 
 
 re_digits = re.compile(r"\d+")
-re_x_proj = re.compile(r"(.*)_([qkv]_proj)$")
+re_x_proj = re.compile(r"(.*)_((?:[qkv]|mlp)_proj)$")
 re_compiled = {}
 
 suffix_conversion = {
@@ -183,8 +183,12 @@ def load_network(name, network_on_disk):
     for key_network, weight in sd.items():
 
         if diffusers_weight_map:
-            key_network_without_network_parts, network_name, network_weight = key_network.rsplit(".", 2)
-            network_part = network_name + '.' + network_weight
+            if key_network.startswith("lora_unet"):
+                key_network_without_network_parts, _, network_part = key_network.partition(".")
+                key_network_without_network_parts = key_network_without_network_parts.replace("lora_unet", "diffusion_model")
+            else:
+                key_network_without_network_parts, network_name, network_weight = key_network.rsplit(".", 2)
+                network_part = network_name + '.' + network_weight
         else:
             key_network_without_network_parts, _, network_part = key_network.partition(".")
 
@@ -377,6 +381,8 @@ def store_weights_backup(weight):
     if weight is None:
         return None
 
+    if shared.opts.lora_without_backup_weight:
+        return True
     return weight.to(devices.cpu, copy=True)
 
 
@@ -393,6 +399,9 @@ def network_restore_weights_from_backup(self: Union[torch.nn.Conv2d, torch.nn.Li
     bias_backup = getattr(self, "network_bias_backup", None)
 
     if weights_backup is None and bias_backup is None:
+        return
+
+    if shared.opts.lora_without_backup_weight:
         return
 
     if weights_backup is not None:
@@ -455,7 +464,7 @@ def network_apply_weights(self: Union[torch.nn.Conv2d, torch.nn.Linear, torch.nn
 
         for net in loaded_networks:
             module = net.modules.get(network_layer_name, None)
-            if module is not None and hasattr(self, 'weight') and not isinstance(module, modules.models.sd3.mmdit.QkvLinear):
+            if module is not None and hasattr(self, 'weight') and not all(isinstance(module, linear) for linear in (modules.models.sd3.mmdit.QkvLinear, modules.models.flux.modules.layers.QkvLinear)):
                 try:
                     with torch.no_grad():
                         if getattr(self, 'fp16_weight', None) is None:
@@ -515,7 +524,9 @@ def network_apply_weights(self: Union[torch.nn.Conv2d, torch.nn.Linear, torch.nn
 
                 continue
 
-            if isinstance(self, modules.models.sd3.mmdit.QkvLinear) and module_q and module_k and module_v:
+            module_mlp = net.modules.get(network_layer_name + "_mlp_proj", None)
+
+            if any(isinstance(self, linear) for linear in (modules.models.sd3.mmdit.QkvLinear, modules.models.flux.modules.layers.QkvLinear)) and module_q and module_k and module_v and module_mlp is None and self.weight.shape[0] // 3 == module_q.up_model.weight.shape[0]:
                 try:
                     with torch.no_grad():
                         # Send "real" orig_weight into MHA's lora module
@@ -526,6 +537,29 @@ def network_apply_weights(self: Union[torch.nn.Conv2d, torch.nn.Linear, torch.nn
                         del qw, kw, vw
                         updown_qkv = torch.vstack([updown_q, updown_k, updown_v])
                         self.weight += updown_qkv
+                        del updown_qkv
+
+                except RuntimeError as e:
+                    logging.debug(f"Network {net.name} layer {network_layer_name}: {e}")
+                    extra_network_lora.errors[net.name] = extra_network_lora.errors.get(net.name, 0) + 1
+
+                continue
+
+            if any(isinstance(self, linear) for linear in (modules.models.flux.modules.layers.QkvLinear,)) and module_q and module_k and module_v:
+                try:
+                    with torch.no_grad():
+                        qw, kw, vw, mlp = torch.tensor_split(self.weight, (3072, 6144, 9216,), 0)
+                        updown_q, _ = module_q.calc_updown(qw)
+                        updown_k, _ = module_k.calc_updown(kw)
+                        updown_v, _ = module_v.calc_updown(vw)
+                        if module_mlp is not None:
+                            updown_mlp, _ = module_mlp.calc_updown(mlp)
+                        else:
+                            updown_mlp = torch.zeros(3072 * 4, 3072, dtype=updown_q.dtype, device=updown_q.device)
+                        del qw, kw, vw, mlp
+                        updown_qkv_mlp = torch.vstack([updown_q, updown_k, updown_v, updown_mlp])
+                        self.weight += updown_qkv_mlp
+                        del updown_qkv_mlp
 
                 except RuntimeError as e:
                     logging.debug(f"Network {net.name} layer {network_layer_name}: {e}")
@@ -539,7 +573,12 @@ def network_apply_weights(self: Union[torch.nn.Conv2d, torch.nn.Linear, torch.nn
             logging.debug(f"Network {net.name} layer {network_layer_name}: couldn't find supported operation")
             extra_network_lora.errors[net.name] = extra_network_lora.errors.get(net.name, 0) + 1
 
-        self.network_current_names = wanted_names
+
+        if shared.opts.lora_without_backup_weight:
+            self.network_weights_backup = None
+            self.network_bias_backup = None
+        else:
+            self.network_current_names = wanted_names
 
 
 def network_forward(org_module, input, original_forward):
